@@ -8,7 +8,18 @@ export default function Dashboard(){
   const [interviews, setInterviews] = useState([]);
   const nav = useNavigate();
 
-  useEffect(()=>{ fetchProfile(); fetchInterviews(); },[]);
+  useEffect(()=>{ 
+    fetchProfile(); 
+    fetchInterviews(); 
+  },[]);
+
+  // Centralized function to kick user out if token is expired/invalid
+  function handleAuthError(err) {
+    if (err.message === "Unauthorized") {
+      localStorage.removeItem("access_token");
+      nav("/login");
+    }
+  }
 
   async function fetchProfile(){
     try{
@@ -16,15 +27,21 @@ export default function Dashboard(){
       setProfile(p);
     }catch(e){
       console.error(e);
+      handleAuthError(e);
     }
   }
 
   async function onUpload(e){
     e.preventDefault();
     if(!file) return alert("Choose PDF");
-    const r = await uploadResume(file);
-    alert("Uploaded: " + JSON.stringify(r));
-    fetchProfile();
+    try {
+      const r = await uploadResume(file);
+      alert("Uploaded: " + JSON.stringify(r));
+      fetchProfile();
+    } catch(err) {
+      alert("Upload failed: " + err.message);
+      handleAuthError(err);
+    }
   }
 
   async function onStart(){
@@ -34,14 +51,19 @@ export default function Dashboard(){
       nav(`/interview/${r.interview_id}`);
     }catch(err){
       alert("Start failed: " + err.message);
+      handleAuthError(err);
     }
   }
 
   async function fetchInterviews(){
     try{
       const list = await listInterviews();
-      setInterviews(list);
-    }catch(e){}
+      // Ensure we always set an array to prevent .map crashes
+      setInterviews(Array.isArray(list) ? list : []);
+    }catch(e){
+      console.error(e);
+      handleAuthError(e);
+    }
   }
 
   return (
@@ -62,11 +84,13 @@ export default function Dashboard(){
       <hr />
       <h3>Past Interviews</h3>
       <ul>
-        {interviews.map(i => (
+        {/* The '?' ensures it only runs if interviews is a valid array */}
+        {interviews?.map(i => (
           <li key={i.id}>
             <Link to={`/interview/${i.id}`}>Interview #{i.id} - {new Date(i.created_at).toLocaleString()}</Link>
           </li>
         ))}
+        {interviews?.length === 0 && <li>No past interviews found.</li>}
       </ul>
     </div>
   );

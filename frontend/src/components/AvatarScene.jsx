@@ -1,18 +1,19 @@
+// frontend/src/components/AvatarScene.jsx
 import React, { Suspense } from "react";
 import { Canvas } from "@react-three/fiber";
 import { OrbitControls, useGLTF } from "@react-three/drei";
 
 function Model({ modelUrl }){
-  const gltf = useGLTF(modelUrl);
+  const gltf = useGLTF(modelUrl, true);
   return <primitive object={gltf.scene} scale={1.2} />;
 }
 
 export default function AvatarScene({ modelUrl = "https://models.babylonjs.com/boombox.glb" }){
   return (
     <div style={{ height: 360 }}>
-      <Canvas>
+      <Canvas dpr={[1, 2]}>
         <ambientLight />
-        <pointLight position={[10,10,10]} />
+        <pointLight position={[10, 10, 10]} />
         <Suspense fallback={null}>
           <Model modelUrl={modelUrl} />
         </Suspense>

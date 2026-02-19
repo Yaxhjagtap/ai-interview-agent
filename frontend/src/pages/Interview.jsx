@@ -29,7 +29,7 @@ export default function Interview() {
     const res = await submitAnswer(id, {
       question_index: currentIndex,
       answer: answerText,
-      transcript_meta: lastTranscriptMeta, // send metadata if available
+      transcript_meta: lastTranscriptMeta,
     });
 
     setStatus("Saved. Score: " + res.score);
@@ -38,9 +38,11 @@ export default function Interview() {
 
     await load();
 
-    setQIndex((prev) =>
-      data && prev < data.questions.length - 1 ? prev + 1 : prev
-    );
+    // move to next question safely
+    setQIndex((prev) => {
+      if (!data || !data.questions) return prev;
+      return prev < data.questions.length - 1 ? prev + 1 : prev;
+    });
   }
 
   async function finish() {
@@ -50,8 +52,16 @@ export default function Interview() {
   }
 
   if (!data) return <div>Loading...</div>;
+  if (!data.questions || data.questions.length === 0)
+    return <div>No questions found</div>;
 
-  const q = data.questions[qIndex];
+  const rawQuestion = data.questions[qIndex];
+
+  // ✅ Handle both string and object formats
+  const questionText =
+    typeof rawQuestion === "object"
+      ? rawQuestion?.question
+      : rawQuestion;
 
   return (
     <div>
@@ -74,7 +84,7 @@ export default function Interview() {
               minHeight: 80,
             }}
           >
-            {q}
+            {questionText}
           </div>
 
           {/* Text Answer Box */}
@@ -85,16 +95,14 @@ export default function Interview() {
             placeholder="Type your answer or use voice..."
           />
 
-          {/* 🎤 Voice Recorder */}
+          {/* Voice Recorder */}
           <div style={{ marginTop: 8 }}>
             <AudioRecorder
               onTranscribed={({ text, segments, duration }) => {
-                // append only the string text
                 setAnswerText((prev) =>
                   prev ? prev + " " + text : text
                 );
 
-                // store metadata separately
                 setLastTranscriptMeta({
                   segments,
                   duration,
