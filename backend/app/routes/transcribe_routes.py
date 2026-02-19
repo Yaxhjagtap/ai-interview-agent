@@ -1,109 +1,99 @@
 # backend/app/routes/transcribe_routes.py
 import os
-import uuid
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException
+import time
+import tempfile
+import shutil
+from typing import Dict, Any
+
+from fastapi import APIRouter, File, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy.orm import Session
-from ..database import SessionLocal
-from .. import crud
-from ..config import SECRET_KEY, ALGORITHM, UPLOAD_DIR
-from jose import jwt, JWTError
 
-# faster-whisper import
-from faster_whisper import WhisperModel
+router = APIRouter(prefix="", tags=["transcribe"])
 
-router = APIRouter(prefix="/transcribe", tags=["transcribe"])
+# Config via env
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "tiny")  # FAST default; change to "small" if you want more accuracy
+WHISPER_USE_GPU = os.getenv("WHISPER_USE_GPU", "false").lower() in ("1", "true", "yes")
 
-# ----------------- simple auth -----------------
-security = HTTPBearer()
+_whisper_model = None
 
-def get_db():
-    db = SessionLocal()
+def _load_whisper_model():
+    global _whisper_model
+    if _whisper_model is not None:
+        return _whisper_model
+
     try:
-        yield db
-    finally:
-        db.close()
-
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
-    token = credentials.credentials
-    cred_exc = HTTPException(status_code=401, detail="Could not validate credentials")
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("user_id")
-        if user_id is None:
-            raise cred_exc
-    except JWTError:
-        raise cred_exc
-    user = crud.get_user(db, user_id)
-    if not user:
-        raise cred_exc
-    return user
-
-# ----------------- model loader (singleton) -----------------
-_MODEL = None
-_MODEL_NAME = os.environ.get("FW_MODEL", "small")  # change to tiny/base/small as desired
-
-def get_model():
-    global _MODEL
-    if _MODEL is None:
-        # pick device/compute based on installed torch/cuda
-        device = "cpu"
-        compute_type = None
-        try:
-            import torch
-            if torch.cuda.is_available():
-                device = "cuda"
-                compute_type = "float16"
-            else:
-                device = "cpu"
-                compute_type = "int8"
-        except Exception:
-            device = "cpu"
-            compute_type = "int8"
-        # instantiate model
-        _MODEL = WhisperModel(_MODEL_NAME, device=device, compute_type=compute_type)
-    return _MODEL
-
-# ----------------- helper to save uploaded file -----------------
-def _save_upload_file(upload_file: UploadFile) -> str:
-    ext = os.path.splitext(upload_file.filename)[1]
-    fn = f"{uuid.uuid4().hex}{ext}"
-    out_path = os.path.join(UPLOAD_DIR, fn)
-    with open(out_path, "wb") as f:
-        f.write(upload_file.file.read())
-    return out_path
-
-# ----------------- transcription endpoint -----------------
-@router.post("/", summary="Upload audio (wav/mp3/webm) and return transcription")
-async def transcribe_audio(file: UploadFile = File(...), current_user = Depends(get_current_user)):
-    # validate file type
-    allowed = (".wav", ".mp3", ".m4a", ".ogg", ".webm", ".flac")
-    filename = file.filename or ""
-    if not any(filename.lower().endswith(x) for x in allowed):
-        raise HTTPException(status_code=400, detail="Audio file required (.wav/.mp3/.m4a/.ogg/.webm/.flac)")
-
-    # save file
-    try:
-        path = _save_upload_file(file)
+        import whisper  # type: ignore
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save upload: {e}")
+        raise RuntimeError(
+            "whisper library not available. Install with `pip install openai-whisper` "
+            "and ensure `ffmpeg` is installed on your system."
+        ) from e
 
     try:
-        model = get_model()
-        # transcribe: returns generator of segments and info
-        segments, info = model.transcribe(path, beam_size=5)
-        text = " ".join([seg.text.strip() for seg in segments if seg.text])
-        # optionally return timestamps for each segment
-        segments_out = [{"start": float(seg.start), "end": float(seg.end), "text": seg.text} for seg in segments]
-        result = {"text": text, "segments": segments_out, "model": _MODEL_NAME, "duration": float(info.duration)}
+        print(f"[transcribe] loading whisper model '{WHISPER_MODEL}' (gpu={WHISPER_USE_GPU}) ...")
+        model = whisper.load_model(WHISPER_MODEL)
+        _whisper_model = model
+        print(f"[transcribe] whisper model '{WHISPER_MODEL}' loaded")
+        return _whisper_model
     except Exception as e:
-        # keep a helpful message but not leak internals
+        raise RuntimeError(f"Failed to load whisper model '{WHISPER_MODEL}': {e}") from e
+
+
+@router.post("/transcribe/")
+async def transcribe_audio(file: UploadFile = File(...), request: Request = None) -> Dict[str, Any]:
+    """
+    Accepts multipart form file under key "file".
+    Returns JSON: { text: str, segments: list, model: str, duration: float, elapsed: float }
+    """
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail="No audio file uploaded.")
+
+    tmp_dir = tempfile.mkdtemp(prefix="transcribe-")
+    tmp_path = os.path.join(tmp_dir, file.filename)
+    try:
+        with open(tmp_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+    except Exception as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {e}")
+
+    start_time = time.time()
+
+    try:
+        model = _load_whisper_model()
+    except RuntimeError as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=501, detail=str(e))
+
+    try:
+        # Force language to English to skip detection (faster)
+        # task='transcribe' is default; set verbose False to reduce logs
+        result = model.transcribe(tmp_path, language="en", temperature=0.0, verbose=False)
+    except Exception as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Transcription failed: {e}")
-    finally:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
 
-    return JSONResponse(result)
+    text = result.get("text", "").strip()
+    segments = result.get("segments", []) or []
+    duration = 0.0
+    if segments:
+        try:
+            duration = float(segments[-1].get("end", 0.0))
+        except Exception:
+            duration = 0.0
+    elapsed = time.time() - start_time
+
+    try:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+    resp = {
+        "text": text,
+        "segments": segments,
+        "model": WHISPER_MODEL,
+        "duration": duration,
+        "elapsed": round(elapsed, 3),
+    }
+
+    return JSONResponse(status_code=200, content=resp)

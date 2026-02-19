@@ -1,3 +1,4 @@
+import os
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
@@ -25,12 +26,10 @@ def get_current_user(
     db: Session = Depends(get_db)
 ):
     token = credentials.credentials
-
     credentials_exception = HTTPException(
         status_code=401,
         detail="Could not validate credentials"
     )
-
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id = payload.get("user_id")
@@ -42,7 +41,6 @@ def get_current_user(
     user = crud.get_user(db, user_id)
     if not user:
         raise credentials_exception
-
     return user
 
 
@@ -66,7 +64,6 @@ def update_me(
         "skills": payload.skills,
         "company_interest": payload.company_interest
     }
-
     updated = crud.update_user(db, current_user, update_data)
     return updated
 
@@ -80,8 +77,10 @@ def upload_resume(
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF resumes allowed")
 
-    filename = f"{current_user.id}_{file.filename.replace(' ', '_')}"
-    path = f"{config.UPLOAD_DIR}/{filename}"
+    # SECURE: Strip directory paths from the filename to prevent traversal attacks
+    safe_filename = os.path.basename(file.filename)
+    filename = f"{current_user.id}_{safe_filename.replace(' ', '_')}"
+    path = os.path.join(config.UPLOAD_DIR, filename)
 
     with open(path, "wb") as f:
         content = file.file.read()
