@@ -1,4 +1,4 @@
-# DeepSeek — AI Interview Agent
+AI Interview Agent
 
 **What it is**
 A full-stack AI-powered mock interview platform for engineering students. Students upload resumes, take spoken interviews with a 3D avatar, and receive structured feedback (technical, communication, depth).
