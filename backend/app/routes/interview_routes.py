@@ -1,627 +1,705 @@
 # backend/app/routes/interview_routes.py
 import os
 import re
+import sys
 import json
 import random
-from typing import List, Any, Optional, Dict
+import logging
+from typing import List, Any, Optional, Dict, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from .. import crud, models, schemas, utils
 from ..routes.user_routes import get_current_user, get_db
-from ..services.llm_service import generate_with_llm
+from ..services.llm_service import generate_with_llm, unwrap_llm_json
 
-# try to import prompts from interview_engine; fallback to inline prompts if module missing
+# ─── Configure Strict Terminal Logging ───────────────────────────────────────
+logger = logging.getLogger("interview_routes")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(handler)
+
+# ─── Inline prompt fallbacks ──────────────
 try:
     from ..interview_engine.llm_prompts import (
-        prompt_generate_questions,
         prompt_evaluate_answer,
-        prompt_follow_up,
         prompt_summarize_resume,
     )
-except Exception:
-    # --- Fresher-level prompt templates (English as default) ---
+except ImportError:
     def prompt_summarize_resume(resume_text: str) -> str:
-        trimmed = (resume_text or "")[:1500]
+        trimmed = (resume_text or "")[:1800]
         return f"""
-You are an interviewer summarizing a candidate's resume (ENGLISH).
-Return STRICT JSON only with:
-{{ "core_skills": ["skill1","skill2"], "projects": [{{"name":"p","tech":["t"],"role":"r"}}] }}
+You are an expert technical recruiter reviewing a recent graduate's resume.
+Extract the core technical skills and major projects. 
+Return STRICT JSON only, no extra text, markdown, or commentary:
+{{
+   "core_skills": ["skill1", "skill2"],
+   "projects": [{{"name": "Project Name", "tech": ["tech1"], "role": "Developer", "highlights": "Key achievement"}}]
+}}
 
-Resume (ENGLISH):
+Resume:
 \"\"\"{trimmed}\"\"\"
-"""
 
-    def prompt_generate_questions(resume_text: str, max_questions: int = 8) -> str:
-        """
-        Fresher-level question generator:
-         - Focus on resume projects, implementation details and beginner CS fundamentals.
-         - Avoid senior-level system design; keep questions accessible for fresh graduates.
-        """
-        trimmed = (resume_text or "")[:1200]
-        return f"""
-You are a calm, professional interviewer speaking English. The candidate is a FRESHER (recent graduate).
-
-Based ONLY on this resume fragment, produce up to {max_questions} simple, beginner-level questions.
-Focus categories:
-  - Resume project implementation details (what you did, libraries, challenges, metrics)
-  - OOP basic concepts
-  - DBMS basic concepts
-  - OS basic concepts
-  - Computer networks basic concepts
-
-Keep each question short and clear (one sentence). Avoid complex system-design or senior architecture questions.
-
-Return STRICT JSON:
-{{ "questions": ["q1","q2", ...] }}
-
-Resume (ENGLISH):
-\"\"\"{trimmed}\"\"\"
+CRITICAL: Return ONLY the JSON object. No markdown formatting, no ```json blocks, no extra text.
 """
 
     def prompt_evaluate_answer(question: str, answer: str, resume_text: str = "") -> str:
-        short_resume = (resume_text or "")[:1000]
+        short_resume = (resume_text or "")[:800]
         return f"""
-You are a senior interviewer evaluating a FRESHER. Return STRICT JSON only:
+You are an empathetic but thorough senior interviewer evaluating a candidate's answer.
+Score them fairly. Reward clarity, honesty, and logical thinking.
 
-{{ "overall_score": 0, "technical": 0, "communication": 0, "depth": 0, "resume_match": 0,
-  "strengths": [], "weaknesses": [], "tips": [] }}
+Provide constructive feedback. Return STRICT JSON only:
+{{
+   "overall_score": 0-100,
+   "technical": 0-100,
+   "communication": 0-100,
+   "depth": 0-100,
+   "resume_match": 0-100,
+   "strengths": ["One clear strength"],
+   "weaknesses": ["One area to improve"],
+   "tips": ["One actionable piece of advice for next time"]
+}}
 
-Language: English
+Question asked: {question}
+Candidate's answer: {answer}
+Resume context: {short_resume}
 
-Question:
-{question}
-
-Candidate answer:
-{answer}
-
-Resume (short):
-{short_resume}
-"""
-
-    def prompt_follow_up(question: str, answer: str) -> str:
-        return f"""
-You are interviewing a fresher in English. Ask exactly ONE short follow-up to check conceptual clarity (not deep design).
-
-Return STRICT JSON:
-{{ "follow_up": "..." }}
-
-Original question:
-{question}
-
-Candidate answer:
-{answer}
+CRITICAL: Return ONLY the JSON object. No markdown formatting, no ```json blocks, no extra text.
 """
 
 router = APIRouter(prefix="/interviews", tags=["interviews"])
 
-# Config - keep same env-driven config
+# Config - env-driven with sensible defaults
 LLM_FORCE_EVAL = os.getenv("LLM_FORCE_EVAL", "false").lower() in ("1", "true", "yes")
-LLM_MODEL_ENV = os.getenv("LLM_MODEL")
+LLM_MODEL_ENV = os.getenv("LLM_MODEL", "default-model")
 SUMMARY_TRUNCATE = int(os.getenv("SUMMARY_TRUNCATE", "1500"))
-LLM_TIMEOUT_SHORT = int(os.getenv("LLM_TIMEOUT_SHORT", "40"))
-LLM_TIMEOUT_LONG = int(os.getenv("LLM_TIMEOUT_LONG", "90"))
 
-# ============================================================
-# Predefined CS fundamentals bank (OOP/DBMS/OS/CN) - kept as fresher-friendly Qs
-# (Use your existing banks; shortened here for readability)
-# ============================================================
-OOP_QS = [
-    "What is encapsulation and why is it useful?",
-    "Explain inheritance with an example.",
-    "What is polymorphism? Give a simple example.",
-    "What is an interface vs an abstract class (short)?",
-    "What are SOLID principles (brief)?" ,
-    "What is composition and why prefer it sometimes?",
-    "How does method overriding differ from overloading?",
-    "What is a design pattern? Name one and explain briefly.",
-    "How would you unit test an OOP class?",
-    "What is an immutable object?"
-]
+AI_FAST_MODE = os.getenv("AI_FAST_MODE", "true").lower() in ("1", "true", "yes")
+INCLUDE_EXPECTED_ANSWER = os.getenv("INCLUDE_EXPECTED_ANSWER", "false").lower() in ("1", "true", "yes")
 
-DBMS_QS = [
-    "What is normalization and why do we normalize?",
-    "What is an index and how does it help queries?",
-    "What is a transaction and ACID briefly?",
-    "When can denormalization help performance?",
-    "What is a foreign key?",
-    "What is the purpose of an execution plan?",
-    "What is replication in databases?"
-]
+LLM_TIMEOUT_SHORT = int(os.getenv("LLM_TIMEOUT_SHORT", "10"))
+LLM_TIMEOUT_LONG = int(os.getenv("LLM_TIMEOUT_LONG", "25"))
 
-OS_QS = [
-    "What is the difference between a process and a thread?",
-    "What is a race condition?",
-    "What is virtual memory in brief?",
-    "What is a mutex vs semaphore?",
-    "What is context switching?",
-    "What is paging?"
-]
+TOTAL_QUESTION_COUNT = 20
 
-CN_QS = [
-    "Explain the TCP three-way handshake in short.",
-    "What is UDP and when to use it?",
-    "What is DNS?",
-    "What is HTTP request/response lifecycle?",
-    "What is TLS in brief?",
-    "What is a socket?"
-]
-
-COMBINED_CS_BANK = OOP_QS + DBMS_QS + OS_QS + CN_QS
-
-# -------------------------
-# Helpers: robust JSON extraction from LLM responses
-# -------------------------
-def _try_parse_json_string(s: Optional[str]) -> Optional[Any]:
-    if not s:
-        return None
-    s = s.strip()
+# ─── Helpers ────────────────────────────────────────────────────────────────
+def _normalize_int_safe(x: Any) -> int:
+    if x is None: 
+        return 0
     try:
-        return json.loads(s)
-    except Exception:
-        pass
-    s2 = s.replace("```json", "").replace("```", "").strip()
-    try:
-        return json.loads(s2)
-    except Exception:
-        pass
-    m = re.search(r'(\{(?:.|\n)*\}|\[(?:.|\n)*\])', s, re.DOTALL)
-    if m:
-        cand = m.group(1)
-        try:
-            return json.loads(cand)
-        except Exception:
-            pass
-    return None
-
-def _unwrap_llm_resp(llm_resp: dict) -> Optional[Any]:
-    if not llm_resp or not isinstance(llm_resp, dict):
-        return None
-    parsed = llm_resp.get("json")
-    raw = llm_resp.get("raw", "") or ""
-    if isinstance(parsed, dict):
-        if any(k in parsed for k in ("core_skills", "projects", "questions", "follow_up", "expected_answer", "comparison")):
-            return parsed
-        msg = parsed.get("message") or parsed.get("result") or parsed.get("output")
-        if isinstance(msg, dict):
-            content = msg.get("content") or msg.get("text") or msg.get("response")
-            if isinstance(content, str) and content.strip():
-                inner = _try_parse_json_string(content)
-                if inner is not None:
-                    return inner
-        if "response" in parsed and isinstance(parsed["response"], str):
-            inner = _try_parse_json_string(parsed["response"])
-            if inner is not None:
-                return inner
-        choices = parsed.get("choices")
-        if isinstance(choices, list) and choices:
-            first = choices[0]
-            if isinstance(first, dict):
-                if "message" in first and isinstance(first["message"], dict):
-                    content = first["message"].get("content") or first["message"].get("text")
-                    if content:
-                        inner = _try_parse_json_string(content)
-                        if inner is not None:
-                            return inner
-                if "text" in first and isinstance(first["text"], str):
-                    inner = _try_parse_json_string(first["text"])
-                    if inner is not None:
-                        return inner
-    if isinstance(parsed, (list, dict)):
-        return parsed
-    if raw:
-        inner = _try_parse_json_string(raw)
-        if inner is not None:
-            return inner
-    return None
-
-def _normalize_int_safe(x):
-    try:
-        return max(0, min(100, int(x)))
-    except Exception:
+        val = int(float(x))
+        return max(0, min(100, val))
+    except (ValueError, TypeError):
         return 0
 
-# -------------------------
-# Prompt for expected answer + comparison (fresher-level)
-# -------------------------
+def _local_expected_answer(question: str, answer: str) -> Dict[str, str]:
+    q = (question or "").lower()
+    if any(k in q for k in ["what is", "explain", "define", "difference"]):
+        expected = "A clear definition accompanied by a brief, practical example."
+    elif any(k in q for k in ["how did you", "implemented", "build", "project", "used"]):
+        expected = "A structured response detailing the problem, your specific technical approach, and the final outcome (STAR method)."
+    else:
+        expected = "A concise, logical answer demonstrating fundamental understanding."
+    return {"expected_answer": expected, "comparison": " Evaluated internally on clarity, technical accuracy, and completeness."}
+
+def _interview_is_completed(interview) -> bool:
+    qs = interview.get_questions() or []
+    answers = interview.get_answers() or []
+    return bool(qs) and len(answers) >= len(qs)
+
+def _set_completion_state(interview, completed: bool, next_question_index: Optional[int] = None):
+    analysis = interview.get_analysis() or {}
+    analysis["completed"] = completed
+    analysis["next_question_index"] = next_question_index
+    interview.set_analysis(analysis)
+
 def prompt_expected_answer(question: str, student_answer: str) -> str:
     q = (question or "")[:800]
     a = (student_answer or "")[:1200]
     return f"""
-You are a senior interviewer producing a short, beginner-level expected answer in ENGLISH for a fresher candidate.
+You are an expert technical mentor. Based on the interview question and the candidate's answer below, provide the ideal response.
 
 Return STRICT JSON only:
-{{ "expected_answer": "A concise (2-3 sentence) exemplary beginner-level answer in English.",
-  "comparison": "A short (1-2 sentence) comparison noting strengths/missing points vs the candidate answer." }}
+{{ 
+  "expected_answer": "A concise (2-3 sentence) exemplary answer a junior engineer should give.",
+  "comparison": "A single sentence noting what the candidate did well and what they missed." 
+}}
 
-Question:
-{q}
+Question: {q}
+Candidate's Answer: {a}
 
-Candidate answer:
-{a}
+CRITICAL: Return ONLY the JSON object. No markdown formatting, no ```json blocks, no extra text.
 """
 
-# -------------------------
-# Routes
-# -------------------------
+# ─── Prompt Builders (Fixed to accept string parameters) ─────────────────────
+
+def _build_resume_based_prompt(resume_data: str, experience: str, total_questions: int) -> str:
+    """Build prompt for resume-based interviews"""
+    trimmed_resume = (resume_data or "")[:1600]
+    
+    return f"""
+You are a friendly, conversational senior engineer conducting a resume-based technical interview.
+
+INTERVIEW CONTEXT:
+- Type: Resume-Based Interview
+- Candidate Experience Level: {experience or "Not specified"}
+- Total Questions Needed: {total_questions}
+
+CANDIDATE RESUME DATA:
+\"\"\"{trimmed_resume}\"\"\"
+
+YOUR TASK:
+Generate exactly {total_questions} personalized interview questions based STRICTLY on the candidate's resume above.
+
+QUESTION DISTRIBUTION:
+1. First 70% (Questions 1-{int(total_questions * 0.7)}): Deep dive into specific projects, technologies, and experiences mentioned in the resume
+   - Ask about specific technologies they used and why
+   - Probe their role in projects described
+   - Ask about challenges faced in their work
+   - Question their technical decisions
+
+2. Last 30% (Questions {int(total_questions * 0.7) + 1}-{total_questions}): General CS fundamentals
+   - Data structures and algorithms
+   - System design basics
+   - OOP concepts
+   - Database fundamentals
+
+RULES:
+- Questions must be conversational and natural
+- Reference specific items from their resume (e.g., "I see you worked on...")
+- Adjust difficulty based on experience level: {experience or "mixed"}
+- NO generic questions that could apply to any candidate
+
+Return STRICT JSON only:
+{{ "questions": ["Question 1 text", "Question 2 text", ...] }}
+
+CRITICAL: Return ONLY the JSON object. No markdown formatting, no ```json blocks, no extra text before or after.
+"""
+
+def _build_company_based_prompt(company: str, role: str, experience: str, total_questions: int) -> str:
+    """Build prompt for company-specific interviews"""
+    
+    return f"""
+You are a senior technical interviewer conducting a company-specific interview for {company}.
+
+INTERVIEW CONTEXT:
+- Target Company: {company}
+- Target Role: {role}
+- Candidate Experience Level: {experience or "Not specified"}
+- Total Questions Needed: {total_questions}
+
+YOUR TASK:
+Generate exactly {total_questions} interview questions tailored for a {role} position at {company}.
+
+QUESTION DISTRIBUTION:
+1. First 60% (Questions 1-{int(total_questions * 0.6)}): Company-specific technical and behavioral questions
+   - Questions about {company}'s products, services, or tech stack
+   - How the candidate would solve problems specific to {company}'s domain
+   - Alignment with {company}'s culture and values
+   - Scenarios relevant to {company}'s business
+
+2. Middle 20% (Questions {int(total_questions * 0.6) + 1}-{int(total_questions * 0.8)}): Role-specific technical questions for {role}
+   - Core competencies required for {role} at {company}
+   - Technical depth appropriate for {experience or "this level"}
+
+3. Last 20% (Questions {int(total_questions * 0.8) + 1}-{total_questions}): General problem-solving and CS fundamentals
+
+RULES:
+- Questions should reflect {company}'s interview style and difficulty
+- Include both technical and behavioral questions
+- Make questions specific to {company} - avoid generic "tell me about yourself"
+- Consider {company}'s scale: ask about distributed systems, scalability if it's a big tech company
+- Adjust technical depth for {experience or "the candidate's experience level"}
+
+Return STRICT JSON only:
+{{ "questions": ["Question 1 text", "Question 2 text", ...] }}
+
+CRITICAL: Return ONLY the JSON object. No markdown formatting, no ```json blocks, no extra text before or after.
+"""
+
+def _build_role_based_prompt(role: str, experience: str, total_questions: int) -> str:
+    """Build prompt for role-specific interviews"""
+    
+    return f"""
+You are a senior technical interviewer conducting a role-specific interview for a {role} position.
+
+INTERVIEW CONTEXT:
+- Target Role: {role}
+- Candidate Experience Level: {experience or "Not specified"}
+- Total Questions Needed: {total_questions}
+
+YOUR TASK:
+Generate exactly {total_questions} interview questions specifically for a {role} role.
+
+QUESTION DISTRIBUTION:
+1. First 60% (Questions 1-{int(total_questions * 0.6)}): Core {role} competencies
+   - Essential technical skills for {role}
+   - Tools, frameworks, and technologies commonly used by {role}s
+   - Architecture and design questions relevant to {role}
+   - Best practices and methodologies for {role}
+
+2. Middle 20% (Questions {int(total_questions * 0.6) + 1}-{int(total_questions * 0.8)}): Experience-appropriate depth
+   - For {experience or "this experience level"}, ask about:
+     - {"Basic concepts and fundamentals" if experience == "fresher" else ""}
+     - {"Practical implementation experience" if experience == "junior" else ""}
+     - {"System design and architecture decisions" if experience in ["mid", "senior"] else ""}
+     - {"Leadership, scaling, and strategic decisions" if experience == "senior" else ""}
+
+3. Last 20% (Questions {int(total_questions * 0.8) + 1}-{total_questions}): General CS fundamentals and problem-solving
+
+RULES:
+- Focus entirely on {role}-specific knowledge and skills
+- Questions should be practical and job-relevant
+- Adjust complexity for {experience or "the specified"} experience level
+- Include scenario-based questions ("How would you handle...")
+- NO questions about specific companies or personal resume items
+
+Return STRICT JSON only:
+{{ "questions": ["Question 1 text", "Question 2 text", ...] }}
+
+CRITICAL: Return ONLY the JSON object. No markdown formatting, no ```json blocks, no extra text before or after.
+"""
+
+# ─── Routes ──────────────────────────────────────────────────────────────────
+
 @router.post("/start", response_model=schemas.StartInterviewResp)
-def start_interview(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    print(f"[start_interview] user={current_user.id} starting interview")
-    if not current_user.resume_path:
-        raise HTTPException(status_code=400, detail="Upload resume first")
+def start_interview(
+    payload: schemas.StartInterviewRequest,  # Now uses the fixed schema with string interview_type
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    logger.info("="*60)
+    logger.info(f"🚀 [START] User {current_user.id} starting interview")
+    
+    # interview_type is now a simple string (not an enum)
+    interview_type = payload.interview_type
+    logger.info(f"📋 [PAYLOAD] Type: {interview_type}, Company: {payload.company}, Role: {payload.role}, Exp: {payload.experience}")
 
-    # Extract resume text and light parse
-    try:
-        text = utils.extract_text_from_pdf(current_user.resume_path) or ""
-        parsed = utils.parse_resume_text(text)
-        resume_keywords = parsed.get("keywords", [])[:80]
-    except Exception as e:
-        print("[start_interview] resume parse error:", e)
-        text = ""
-        parsed = {"keywords": []}
-        resume_keywords = []
+    # Validation based on interview type (using string comparison)
+    if interview_type == "company":
+        if not payload.company or not payload.role:
+            logger.error("❌ [START] Missing company or role for company interview")
+            raise HTTPException(status_code=400, detail="Company and role are required for company-specific interviews")
+    
+    elif interview_type == "role":
+        if not payload.role:
+            logger.error("❌ [START] Missing role for role interview")
+            raise HTTPException(status_code=400, detail="Role is required for role-specific interviews")
+    
+    elif interview_type == "resume":
+        if not current_user.resume_path:
+            logger.error("❌ [START] Missing resume for resume-based interview")
+            raise HTTPException(status_code=400, detail="Resume upload required for resume-based interviews")
 
-    # STEP 1: summarize resume (LLM)
-    summary_data = {"core_skills": parsed.get("skills", []), "projects": []}
-    try:
-        print("[start_interview] summarizing resume with LLM...")
-        sum_prompt = prompt_summarize_resume((text or "")[:SUMMARY_TRUNCATE])
-        sum_resp = generate_with_llm(sum_prompt, model=LLM_MODEL_ENV, timeout=LLM_TIMEOUT_SHORT)
-        print("[start_interview] summarize raw ok:", sum_resp.get("ok"), "error:", sum_resp.get("error"))
-        unwrapped = _unwrap_llm_resp(sum_resp)
-        if unwrapped and isinstance(unwrapped, dict):
-            if "core_skills" in unwrapped or "projects" in unwrapped:
-                summary_data = unwrapped
-                print("[start_interview] resume summary parsed by LLM (unwrapped).")
-            else:
-                if "skills" in unwrapped and isinstance(unwrapped["skills"], list):
-                    summary_data["core_skills"] = unwrapped["skills"]
-                    print("[start_interview] resume summary mapped from unwrapped dict.")
+    summary_data = {}
+    resume_text = ""
+    resume_keywords = []
+
+    # Extract resume data ONLY for resume-based interviews
+    if interview_type == "resume":
+        logger.info("📄 [START] Processing resume for resume-based interview...")
+        try:
+            resume_text = utils.extract_text_from_pdf(current_user.resume_path) or ""
+            parsed = utils.parse_resume_text(resume_text)
+            resume_keywords = parsed.get("keywords", [])[:80]
+            
+            if resume_text:
+                sum_prompt = prompt_summarize_resume(resume_text[:SUMMARY_TRUNCATE])
+                sum_resp = generate_with_llm(
+                    sum_prompt,
+                    model=LLM_MODEL_ENV,
+                    timeout=LLM_TIMEOUT_SHORT if AI_FAST_MODE else LLM_TIMEOUT_LONG,
+                    fast=AI_FAST_MODE,
+                )
+                unwrapped = unwrap_llm_json(sum_resp)
+                if isinstance(unwrapped, dict) and ("core_skills" in unwrapped or "projects" in unwrapped):
+                    summary_data = unwrapped
+                    logger.info(f"✅ [START] Resume summary generated: {len(summary_data.get('core_skills', []))} skills, {len(summary_data.get('projects', []))} projects")
                 else:
-                    print("[start_interview] resume summary unwrapped but missing expected keys; using fallback parsed data.")
-        else:
-            print("[start_interview] resume summary failed or not JSON; using parsed fallback.")
-    except Exception as e:
-        print("[start_interview] resume summarization exception:", e)
-        summary_data = {"core_skills": parsed.get("skills", [])[:10], "projects": []}
+                    logger.warning("⚠️ [START] Resume summary returned invalid format")
+                    summary_data = {"raw_text_preview": resume_text[:500]}
+        except Exception as e:
+            logger.warning(f"⚠️ [START] Resume processing failed: {e}")
+            summary_data = {"error": "Failed to parse resume", "raw_text_preview": resume_text[:500] if resume_text else ""}
+    else:
+        logger.info(f"⏩ [START] Skipping resume processing for {interview_type} interview")
 
-    # STEP 2: generate targeted questions via LLM (short prompt)
-    questions: List[str] = []
+    # Generate questions using type-specific prompts
+    final_questions = []
     try:
-        print("[start_interview] generating questions with LLM...")
-        gen_prompt = prompt_generate_questions(json.dumps(summary_data), max_questions=24)
-        q_resp = generate_with_llm(gen_prompt, model=LLM_MODEL_ENV, timeout=LLM_TIMEOUT_SHORT)
-        print("[start_interview] generate questions raw ok:", q_resp.get("ok"), "error:", q_resp.get("error"))
-        q_unwrapped = _unwrap_llm_resp(q_resp)
-        if q_unwrapped:
-            if isinstance(q_unwrapped, dict) and "questions" in q_unwrapped and isinstance(q_unwrapped["questions"], list):
-                questions = q_unwrapped["questions"]
-            elif isinstance(q_unwrapped, list):
-                questions = [str(x) for x in q_unwrapped]
+        # Select appropriate prompt builder based on interview type (string comparison)
+        if interview_type == "resume":
+            prompt = _build_resume_based_prompt(
+                json.dumps(summary_data, ensure_ascii=False) if summary_data else resume_text,
+                payload.experience or "",
+                TOTAL_QUESTION_COUNT
+            )
+        elif interview_type == "company":
+            prompt = _build_company_based_prompt(
+                payload.company,
+                payload.role,
+                payload.experience or "",
+                TOTAL_QUESTION_COUNT
+            )
+        elif interview_type == "role":
+            prompt = _build_role_based_prompt(
+                payload.role,
+                payload.experience or "",
+                TOTAL_QUESTION_COUNT
+            )
+        else:
+            raise ValueError(f"Unknown interview type: {interview_type}")
+
+        logger.info(f"🤖 [START] Calling LLM with {interview_type}-specific prompt...")
+        
+        resp = generate_with_llm(
+            prompt,
+            model=LLM_MODEL_ENV,
+            timeout=LLM_TIMEOUT_LONG if AI_FAST_MODE else LLM_TIMEOUT_LONG * 2,
+            fast=AI_FAST_MODE,
+        )
+        
+        # Parse LLM response
+        unwrapped = unwrap_llm_json(resp)
+        
+        if isinstance(unwrapped, dict) and "questions" in unwrapped:
+            raw_questions = unwrapped["questions"]
+            if isinstance(raw_questions, list):
+                final_questions = [str(q).strip() for q in raw_questions if str(q).strip()]
             else:
-                for k, v in (q_unwrapped.items() if isinstance(q_unwrapped, dict) else []):
-                    if isinstance(v, list) and all(isinstance(i, str) for i in v):
-                        questions = v
-                        break
-        if questions:
-            print("[start_interview] LLM provided questions count:", len(questions))
+                raise ValueError(f"LLM returned 'questions' as {type(raw_questions)}, expected list")
+        elif isinstance(unwrapped, list):
+            final_questions = [str(q).strip() for q in unwrapped if str(q).strip()]
         else:
-            print("[start_interview] LLM returned no usable questions; will fallback.")
+            raise ValueError(f"LLM returned unexpected type: {type(unwrapped)}")
+
+        logger.info(f"✅ [START] LLM generated {len(final_questions)} questions")
+
+        # Trim if too many (no padding/fallbacks as requested)
+        if len(final_questions) > TOTAL_QUESTION_COUNT:
+            logger.info(f"✂️ [START] Trimming {len(final_questions)} to {TOTAL_QUESTION_COUNT}")
+            final_questions = final_questions[:TOTAL_QUESTION_COUNT]
+        
+        # If too few, we accept what we got (no hardcoded fallbacks per request)
+        if len(final_questions) < TOTAL_QUESTION_COUNT:
+            logger.warning(f"⚠️ [START] LLM returned only {len(final_questions)}/{TOTAL_QUESTION_COUNT} questions. Proceeding with available questions.")
+
     except Exception as e:
-        print("[start_interview] question generation exception:", e)
+        logger.error(f"💥 [START] Question generation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate interview questions: {str(e)}")
 
-    # Fallback heuristics to ensure minimum resume-based questions (minimum 15)
-    if not questions:
-        print("[start_interview] using heuristic question generator fallback")
-        questions = utils.generate_questions_from_parsed(parsed, max_questions=8)
+    if not final_questions:
+        logger.error("❌ [START] No questions generated")
+        raise HTTPException(status_code=500, detail="No questions were generated. Please try again.")
 
-    if len(questions) < 15:
-        extras = utils.generate_questions_from_parsed(parsed, max_questions=30)
-        combined = list(dict.fromkeys(questions + extras))
-        questions = combined[:15]
-        print("[start_interview] ensured minimum resume questions:", len(questions))
+    # Determine Title for UI
+    if interview_type == "company":
+        title_meta = f"{payload.company} - {payload.role}"
+    elif interview_type == "role":
+        title_meta = f"{payload.role} Role"
+    else:
+        title_meta = "Resume Based"
 
-    # Append 10 CS fundamentals chosen from the combined bank (ensure no duplicates)
-    cs_bank = COMBINED_CS_BANK.copy()
-    cs_bank = [q for q in cs_bank if q not in questions]
-    cs_to_add = []
-    try:
-        if len(cs_bank) >= 10:
-            cs_to_add = random.sample(cs_bank, 10)
-        else:
-            cs_to_add = cs_bank[:10]
-    except Exception:
-        cs_to_add = cs_bank[:10]
-
-    final_questions = questions + cs_to_add
-
-    # normalize: ensure strings and safe shape
-    normalized_qs = []
-    for q in final_questions:
-        if isinstance(q, dict):
-            normalized_qs.append(q.get("question") or json.dumps(q))
-        else:
-            normalized_qs.append(str(q))
-
+    # DB Persistence
     interview = models.Interview(user_id=current_user.id)
-    interview.set_questions(normalized_qs)
+    interview.set_questions(final_questions)
     interview.set_answers([])
-    interview.set_analysis({"resume_summary": summary_data, "resume_keywords": resume_keywords})
+    
+    analysis_data = {
+        "interview_title": f"{title_meta} ({payload.experience or 'General'})",
+        "interview_config": {
+            "type": interview_type,  # Store as string
+            "company": payload.company,
+            "role": payload.role,
+            "experience": payload.experience
+        },
+        "resume_summary": summary_data if interview_type == "resume" else None,
+        "resume_keywords": resume_keywords if interview_type == "resume" else [],
+        "question_mode": f"llm_{interview_type}_generation",
+        "total_question_count": len(final_questions),
+        "completed": False,
+        "next_question_index": 0,
+    }
+    interview.set_analysis(analysis_data)
+
     created = crud.create_interview(db, interview)
-    first_q = normalized_qs[0] if normalized_qs else None
-    print(f"[start_interview] created interview id={created.id} questions={len(normalized_qs)}")
-    return {"interview_id": created.id, "first_question": first_q}
+    first_q = final_questions[0] if final_questions else None
+
+    logger.info(f"🎉 [START] Interview {created.id} created with {len(final_questions)} questions")
+    logger.info("="*60)
+    
+    return {
+        "interview_id": created.id, 
+        "first_question": first_q, 
+        "total_questions": len(final_questions)
+    }
+
 
 @router.get("/{interview_id}")
 def get_interview(interview_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     interview = crud.get_interview(db, interview_id)
     if not interview or interview.user_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Interview not found")
+        raise HTTPException(status_code=404, detail="Interview not found or access denied")
+
+    questions = interview.get_questions() or []
+    answers = interview.get_answers() or []
+    completed = _interview_is_completed(interview)
+    next_idx = None if completed else len(answers)
+
+    is_currently_last_question = (next_idx == len(questions) - 1) if not completed else True
+
     return {
         "id": interview.id,
-        "questions": interview.get_questions(),
-        "answers": interview.get_answers(),
+        "questions": questions,
+        "answers": answers,
         "analysis": interview.get_analysis(),
         "created_at": interview.created_at,
+        "is_completed": completed,
+        "next_question_index": next_idx,
+        "current_question": None if completed or next_idx is None or next_idx >= len(questions) else questions[next_idx],
+        "remaining_questions": max(0, len(questions) - len(answers)),
+        "total_questions": len(questions),
+        "is_last_question": is_currently_last_question,
     }
 
-@router.post("/{interview_id}/answer", response_model=schemas.SimpleScore)
-def submit_answer(interview_id: int, payload: schemas.AnswerPayload, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+
+@router.post("/{interview_id}/answer")
+def submit_answer(
+    interview_id: int,
+    payload: schemas.AnswerPayload,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    logger.info(f"🎙️ [ANSWER] User {current_user.id} submitting answer for interview {interview_id}, Q-Index {payload.question_index}")
     interview = crud.get_interview(db, interview_id)
     if not interview or interview.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Interview not found")
 
-    questions = interview.get_questions()
+    questions = interview.get_questions() or []
+    if not questions:
+        raise HTTPException(status_code=400, detail="Interview contains no questions")
+
+    if _interview_is_completed(interview):
+        raise HTTPException(status_code=409, detail="Interview already completed")
+
     if payload.question_index < 0 or payload.question_index >= len(questions):
         raise HTTPException(status_code=400, detail="Invalid question index")
+
+    answers = interview.get_answers() or []
+    expected_index = len(answers)
+    
+    if payload.question_index != expected_index:
+        raise HTTPException(status_code=409, detail=f"Expected question index {expected_index}, got {payload.question_index}")
 
     qtext_raw = questions[payload.question_index]
     qtext = qtext_raw.get("question") if isinstance(qtext_raw, dict) and "question" in qtext_raw else qtext_raw
 
-    # Prefer transcript text if provided
     answer_text = payload.answer or ""
     transcript_meta = getattr(payload, "transcript_meta", None)
     if transcript_meta and isinstance(transcript_meta, dict) and transcript_meta.get("text"):
         answer_text = transcript_meta.get("text")
 
-    print(f"[submit_answer] interview={interview_id} idx={payload.question_index}")
-    print(f"[submit_answer] question (short): {str(qtext)[:160]}")
-    print(f"[submit_answer] answer (short): {answer_text[:200]}")
-
-    # Attempt LLM evaluation if configured, else use heuristic fallback
     score_obj = None
     if LLM_FORCE_EVAL:
         try:
-            eval_prompt = prompt_evaluate_answer(qtext, answer_text, resume_text=json.dumps(interview.get_analysis().get("resume_summary", {})))
-            print("[submit_answer] calling LLM for full evaluation...")
-            llm_eval = generate_with_llm(eval_prompt, model=LLM_MODEL_ENV, timeout=LLM_TIMEOUT_LONG)
-            print("[submit_answer] llm eval ok:", llm_eval.get("ok"), "error:", llm_eval.get("error"))
-            eval_unwrapped = _unwrap_llm_resp(llm_eval)
+            logger.info(f"🤖 [ANSWER] Running LLM Evaluation...")
+            # Get resume summary if available
+            analysis = interview.get_analysis() or {}
+            resume_summary = analysis.get("resume_summary", {})
+            
+            eval_prompt = prompt_evaluate_answer(
+                qtext,
+                answer_text,
+                resume_text=json.dumps(resume_summary) if resume_summary else ""
+            )
+            llm_eval = generate_with_llm(
+                eval_prompt,
+                model=LLM_MODEL_ENV,
+                timeout=LLM_TIMEOUT_SHORT if AI_FAST_MODE else LLM_TIMEOUT_LONG,
+                fast=AI_FAST_MODE,
+            )
+            eval_unwrapped = unwrap_llm_json(llm_eval)
             if isinstance(eval_unwrapped, dict):
                 score_obj = eval_unwrapped
-                print("[submit_answer] LLM evaluation used; overall:", score_obj.get("overall_score"))
+                logger.info(f"✅ [ANSWER] LLM Evaluation: {score_obj.get('overall_score')}/100")
         except Exception as e:
-            print("[submit_answer] LLM evaluation error:", e)
+            logger.warning(f"⚠️ [ANSWER] LLM eval failed: {e}")
 
     if not score_obj:
-        print("[submit_answer] using heuristic scoring fallback")
-        expected = re.findall(r"\w+", str(qtext))[:12] if qtext else []
-        score_obj = utils.score_answer_text(answer_text, expected_keywords=[w for w in expected], transcript_meta=transcript_meta)
-        if isinstance(score_obj, dict):
-            if "overall_score" not in score_obj:
-                score_obj["overall_score"] = int(score_obj.get("score", 0))
-            score_obj.setdefault("technical", int(score_obj.get("technical", 0)))
-            score_obj.setdefault("communication", int(score_obj.get("communication", 0)))
-            score_obj.setdefault("depth", int(score_obj.get("depth", 0)))
-            score_obj.setdefault("resume_match", int(score_obj.get("resume_bonus", 0)))
-        else:
+        logger.info(f"⚙️ [ANSWER] Using heuristic scoring...")
+        expected_keywords = list(set(re.findall(r"\w+", str(qtext).lower())))[:15]
+        score_obj = utils.score_answer_text(
+            answer_text,
+            expected_keywords=expected_keywords,
+            transcript_meta=transcript_meta
+        )
+        if not isinstance(score_obj, dict):
+            fallback_score = int(score_obj) if isinstance(score_obj, (int, float)) else 50
             score_obj = {
-                "overall_score": int(score_obj) if isinstance(score_obj, (int, float)) else 0,
-                "technical": 0, "communication": 0, "depth": 0, "resume_match": 0,
-                "strengths": [], "weaknesses": [], "tips": []
+                "overall_score": fallback_score,
+                "technical": fallback_score,
+                "communication": fallback_score,
+                "depth": fallback_score,
+                "resume_match": fallback_score,
+                "strengths": ["Clear delivery"] if len(answer_text) > 50 else [],
+                "weaknesses": ["Answer lacked depth"] if len(answer_text) < 50 else [],
+                "tips": ["Try to elaborate more on your thought process."],
             }
-        print("[submit_answer] heuristic overall:", score_obj.get("overall_score"))
 
-    # Normalize numeric bounds
-    score_obj["overall_score"] = _normalize_int_safe(score_obj.get("overall_score", score_obj.get("score", 0)))
-    score_obj["technical"] = _normalize_int_safe(score_obj.get("technical", 0))
-    score_obj["communication"] = _normalize_int_safe(score_obj.get("communication", 0))
-    score_obj["depth"] = _normalize_int_safe(score_obj.get("depth", 0))
-    score_obj["resume_match"] = _normalize_int_safe(score_obj.get("resume_match", 0))
-    score_obj.setdefault("strengths", [])
-    score_obj.setdefault("weaknesses", [])
-    score_obj.setdefault("tips", [])
+    score_obj = {
+        "overall_score": _normalize_int_safe(score_obj.get("overall_score", score_obj.get("score", 0))),
+        "technical": _normalize_int_safe(score_obj.get("technical", 0)),
+        "communication": _normalize_int_safe(score_obj.get("communication", 0)),
+        "depth": _normalize_int_safe(score_obj.get("depth", 0)),
+        "resume_match": _normalize_int_safe(score_obj.get("resume_match", 0)),
+        "strengths": score_obj.get("strengths", []),
+        "weaknesses": score_obj.get("weaknesses", []),
+        "tips": score_obj.get("tips", []),
+    }
 
-    # Append answer record
-    answers = interview.get_answers() or []
     answers.append({
         "question_index": payload.question_index,
         "question": qtext,
         "answer": answer_text,
         "score": score_obj,
-        "transcript_meta": transcript_meta
+        "transcript_meta": transcript_meta,
     })
     interview.set_answers(answers)
+
+    next_question_index = payload.question_index + 1
+    completed = next_question_index >= len(questions)
+    is_currently_last_question = (next_question_index == len(questions) - 1) if not completed else True
+    _set_completion_state(interview, completed=completed, next_question_index=None if completed else next_question_index)
+
     crud.save_interview(db, interview)
-    print(f"[submit_answer] saved; total answers now: {len(answers)}")
 
-    # Generate expected answer + comparison using LLM (best-effort, short timeout)
-    expected_answer = None
-    comparison = None
-    try:
-        exp_prompt = prompt_expected_answer(qtext, answer_text)
-        exp_resp = generate_with_llm(exp_prompt, model=LLM_MODEL_ENV, timeout=LLM_TIMEOUT_SHORT)
-        print("[submit_answer] expected-answer raw ok:", exp_resp.get("ok"), "error:", exp_resp.get("error"))
-        exp_unwrapped = _unwrap_llm_resp(exp_resp)
-        if isinstance(exp_unwrapped, dict):
-            expected_answer = exp_unwrapped.get("expected_answer") or exp_unwrapped.get("expected")
-            comparison = exp_unwrapped.get("comparison") or exp_unwrapped.get("compare")
-        else:
-            parsed = _try_parse_json_string(exp_resp.get("raw", "") or "")
-            if isinstance(parsed, dict):
-                expected_answer = parsed.get("expected_answer") or parsed.get("expected")
-                comparison = parsed.get("comparison") or parsed.get("compare")
-    except Exception as e:
-        print("[submit_answer] expected-answer generation error:", e)
+    expected_payload = _local_expected_answer(qtext, answer_text)
+    expected_answer: str = expected_payload["expected_answer"]
+    comparison: str = expected_payload["comparison"]
 
-    if not expected_answer:
-        expected_answer = "A concise, clear explanation covering main steps, reasoning, and tradeoffs."
-    if not comparison:
-        comparison = "Comparison unavailable: the student's answer will be compared to expected points; missing technical details or examples will reduce the technical score."
+    if INCLUDE_EXPECTED_ANSWER:
+        try:
+            logger.info("🤖 [ANSWER] Generating expected answer via LLM...")
+            exp_prompt = prompt_expected_answer(qtext, answer_text)
+            exp_resp = generate_with_llm(
+                exp_prompt,
+                model=LLM_MODEL_ENV,
+                timeout=LLM_TIMEOUT_SHORT,
+                fast=AI_FAST_MODE,
+            )
+            exp_unwrapped = unwrap_llm_json(exp_resp)
+            if isinstance(exp_unwrapped, dict):
+                expected_answer = exp_unwrapped.get("expected_answer", expected_answer)
+                comparison = exp_unwrapped.get("comparison", comparison)
+        except Exception as e:
+            logger.warning(f"⚠️ [ANSWER] Expected-answer LLM failed: {e}")
 
-    # Follow-up generation (existing logic)
-    follow_ups: List[str] = []
-    try:
-        fu_prompt = prompt_follow_up(qtext, answer_text)
-        print("[submit_answer] requesting LLM follow-up (quick)...")
-        fu_resp = generate_with_llm(fu_prompt, model=LLM_MODEL_ENV, timeout=LLM_TIMEOUT_SHORT)
-        print("[submit_answer] fu raw ok:", fu_resp.get("ok"), "error:", fu_resp.get("error"))
-        fu_unwrapped = _unwrap_llm_resp(fu_resp)
-        if isinstance(fu_unwrapped, dict) and "follow_up" in fu_unwrapped:
-            fu = fu_unwrapped.get("follow_up")
-            if fu:
-                follow_ups.append(str(fu))
-                print("[submit_answer] LLM follow-up:", fu)
-        elif isinstance(fu_unwrapped, str):
-            follow_ups.append(fu_unwrapped)
-            print("[submit_answer] LLM follow-up (string):", fu_unwrapped)
-    except Exception as e:
-        print("[submit_answer] LLM follow-up error:", e)
-
-    if not follow_ups:
-        key_noun = None
-        m = re.search(r"(project|module|service|database|api|algorithm|function|component|model|schema|index)", str(qtext), re.I)
-        if m:
-            key_noun = m.group(1)
-        follow_ups.append(f"For the previous answer, explain the key design decision for the {key_noun or 'component'} in more detail.")
-        follow_ups.append("What testing strategy and edge-case handling would you implement for this part of the system?")
-
-    # Insert follow-ups after current question index (prevent unlimited insertion)
-    qs = interview.get_questions() or []
-    insert_at = payload.question_index + 1
-    for i, fu in enumerate(follow_ups[:2]):
-        if insert_at + i <= len(qs):
-            qs.insert(insert_at + i, fu)
-        else:
-            qs.append(fu)
-    interview.set_questions(qs)
-    crud.save_interview(db, interview)
-    if follow_ups:
-        print(f"[submit_answer] appended {len(follow_ups[:2])} follow-up(s) at index {insert_at}")
-
-    # Return details including expected answer + comparison for frontend TTS
+    logger.info(f"✅ [ANSWER] Recorded answer for Q{payload.question_index + 1}")
     return {
-        "score": score_obj.get("overall_score"),
-        "technical": score_obj.get("technical"),
-        "communication": score_obj.get("communication"),
+        "score": score_obj["overall_score"],
+        "technical": score_obj["technical"],
+        "communication": score_obj["communication"],
         "details": score_obj,
         "expected_answer": expected_answer,
-        "comparison": comparison
+        "comparison": comparison,
+        "is_last_question": is_currently_last_question,
+        "interview_completed": completed,
+        "next_question_index": None if completed else next_question_index,
+        "next_question": None if completed else questions[next_question_index],
+        "questions_count": len(questions),
+        "answers_count": len(answers),
     }
+
 
 @router.post("/{interview_id}/finish")
 def finish_interview(interview_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    logger.info(f"🏁 [FINISH] User {current_user.id} finishing interview {interview_id}")
     interview = crud.get_interview(db, interview_id)
     if not interview or interview.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Interview not found")
+        
     answers = interview.get_answers() or []
     if not answers:
-        raise HTTPException(status_code=400, detail="No answers submitted")
+        raise HTTPException(status_code=400, detail="Cannot finish interview with no submitted answers")
 
-    # Aggregate metrics robustly
-    total_scores = []
-    technicals = []
-    comms = []
-    depths = []
-    resume_matches = []
+    total_scores, technicals, comms, depths, resume_matches = [], [], [], [], []
     strengths_acc: Dict[str, int] = {}
     weaknesses_acc: Dict[str, int] = {}
     tips_acc: Dict[str, int] = {}
 
     for a in answers:
         s = a.get("score") or {}
-        overall = s.get("overall_score") or s.get("score") or 0
-        technicals.append(int(s.get("technical", 0)))
-        comms.append(int(s.get("communication", 0)))
-        depths.append(int(s.get("depth", 0)))
-        resume_matches.append(int(s.get("resume_match", 0)))
-        total_scores.append(int(overall))
+        total_scores.append(_normalize_int_safe(s.get("overall_score") or s.get("score")))
+        technicals.append(_normalize_int_safe(s.get("technical")))
+        comms.append(_normalize_int_safe(s.get("communication")))
+        depths.append(_normalize_int_safe(s.get("depth")))
+        resume_matches.append(_normalize_int_safe(s.get("resume_match")))
 
-        # aggregate strengths/weaknesses keywords
-        for st in (s.get("strengths") or []):
-            strengths_acc[st] = strengths_acc.get(st, 0) + 1
-        for wk in (s.get("weaknesses") or []):
-            weaknesses_acc[wk] = weaknesses_acc.get(wk, 0) + 1
-        for tip in (s.get("tips") or []):
-            tips_acc[tip] = tips_acc.get(tip, 0) + 1
+        for st in (s.get("strengths") or []): strengths_acc[st] = strengths_acc.get(st, 0) + 1
+        for wk in (s.get("weaknesses") or []): weaknesses_acc[wk] = weaknesses_acc.get(wk, 0) + 1
+        for tip in (s.get("tips") or []): tips_acc[tip] = tips_acc.get(tip, 0) + 1
 
-    avg_score = int(sum(total_scores) / len(total_scores))
-    technical_avg = int(sum(technicals) / max(1, len(technicals)))
-    communication_avg = int(sum(comms) / max(1, len(comms)))
-    depth_avg = int(sum(depths) / max(1, len(depths)))
-    resume_match_avg = int(sum(resume_matches) / max(1, len(resume_matches)))
+    ans_len = max(1, len(answers))
+    avg_score = int(sum(total_scores) / ans_len)
+    technical_avg = int(sum(technicals) / ans_len)
+    communication_avg = int(sum(comms) / ans_len)
+    depth_avg = int(sum(depths) / ans_len)
+    resume_match_avg = int(sum(resume_matches) / ans_len)
 
-    # top strengths/weaknesses
-    top_strengths = sorted(strengths_acc.items(), key=lambda x: -x[1])[:5]
-    top_weaknesses = sorted(weaknesses_acc.items(), key=lambda x: -x[1])[:8]
-    top_tips = sorted(tips_acc.items(), key=lambda x: -x[1])[:8]
+    top_strengths = [k for k, _ in sorted(strengths_acc.items(), key=lambda x: -x[1])[:5]]
+    top_weaknesses = [k for k, _ in sorted(weaknesses_acc.items(), key=lambda x: -x[1])[:8]]
+    top_tips = [k for k, _ in sorted(tips_acc.items(), key=lambda x: -x[1])[:8]]
 
-    # Derive prioritized improvement tips
     improvement_tips = []
     if technical_avg < 60:
-        improvement_tips.append("Strengthen core technical knowledge: DS & algorithms and system basics. Practice explaining complexity.")
+        improvement_tips.append("Strengthen core technical knowledge. Focus on being able to concisely explain how your tools work under the hood.")
     else:
-        improvement_tips.append("Technical fundamentals look solid — focus on concise tradeoffs and benchmarks.")
+        improvement_tips.append("Technical fundamentals look solid! To take it to the next level, start discussing edge-cases and performance trade-offs.")
 
     if communication_avg < 60:
-        improvement_tips.append("Work on structured answers: use STAR / Problem→Approach→Result format and practice clear speech (aim 120-160 wpm).")
+        improvement_tips.append("Structure is key. Try using the STAR method (Situation, Task, Action, Result) so your answers don't wander.")
     else:
-        improvement_tips.append("Communication is good — reduce filler words under time pressure.")
+        improvement_tips.append("Strong communication. You articulated your points well. Continue refining your technical explanations to be punchy.")
 
-    if depth_avg < 50:
-        improvement_tips.append("Provide deeper design and edge-case reasoning where applicable.")
-    else:
-        improvement_tips.append("Depth is acceptable — add concrete examples or micro-optimizations.")
-
-    if resume_match_avg < 50:
-        improvement_tips.append("Tie answers explicitly to resume projects and outcomes.")
-    else:
-        improvement_tips.append("Good resume alignment — continue referencing modules and metrics.")
-
-    # Consolidated recommended 4-week study plan (practical)
     study_plan = [
-        "Week 1 — Data Structures & Algorithms: practice 10 problems and explain approach & complexity.",
-        "Week 2 — Databases & Caching: indexing, query tuning, read replica basics, simple caching examples.",
-        "Week 3 — OOP & Testing: SOLID principles, patterns, unit tests and small refactors.",
-        "Week 4 — OS & Networks fundamentals: processes, threads, basic socket programming and mock interviews."
+        "Week 1: Foundations - Review core principles of your primary language and common data structures.",
+        "Week 2: Systems - Practice explaining database behaviors (indexing, joins) and basic API architecture.",
+        "Week 3: Code Design - Brush up on OOP, SOLID principles, and clean code practices.",
+        "Week 4: Mocking - Conduct 2-3 behavioral and technical mock interviews focusing specifically on your weak points.",
     ]
 
-    actionable_from_weaknesses = []
-    for wk, cnt in top_weaknesses[:5]:
-        actionable_from_weaknesses.append(f"{wk} — practice short Q&A and prepare one concrete example next time.")
+    actionable_from_weaknesses = [f"{wk} — Prioritize this in your study plan this week." for wk in top_weaknesses[:5]]
 
-    analysis = {
+    analysis = interview.get_analysis() or {}
+    analysis.update({
         "overall_score": avg_score,
         "by_category": {
             "technical_avg": technical_avg,
             "communication_avg": communication_avg,
             "depth_avg": depth_avg,
-            "resume_match_avg": resume_match_avg
+            "resume_match_avg": resume_match_avg,
         },
-        "top_strengths": [s for s, _ in top_strengths],
-        "top_weaknesses": [w for w, _ in top_weaknesses],
-        "aggregated_tips": [t for t, _ in top_tips],
+        "top_strengths": top_strengths,
+        "top_weaknesses": top_weaknesses,
+        "aggregated_tips": top_tips,
         "improvement_tips": improvement_tips,
         "actionable_from_weaknesses": actionable_from_weaknesses,
         "suggested_4_week_plan": study_plan,
-        "detailed_per_answer": answers
-    }
+        "detailed_per_answer": answers,
+        "completed": True,
+        "next_question_index": None,
+    })
 
     interview.set_analysis(analysis)
     crud.save_interview(db, interview)
-    print(f"[finish_interview] interview={interview_id} final analysis:", analysis)
+    
+    logger.info(f"✅ [FINISH] Interview {interview_id} finalized. Score: {avg_score}")
     return analysis
+
 
 @router.get("/")
 def list_interviews(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
@@ -630,8 +708,8 @@ def list_interviews(db: Session = Depends(get_db), current_user: models.User = D
         {
             "id": i.id,
             "created_at": i.created_at,
-            "questions_count": len(i.get_questions()),
-            "answers_count": len(i.get_answers()),
+            "questions_count": len(i.get_questions() or []),
+            "answers_count": len(i.get_answers() or []),
             "analysis": i.get_analysis(),
         }
         for i in items

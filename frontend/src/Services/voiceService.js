@@ -1,148 +1,154 @@
-// src/services/voiceService.js
-import axios from "axios";
+import { audioState } from "./api";
 
-const ELEVENLABS_KEY = import.meta.env.VITE_ELEVENLABS_KEY || "";
-const VOICE_ID = import.meta.env.VITE_ELEVEN_VOICE_ID || "pNInz6obpgDQGcFmaJgB"; // "Adam" - Deep Male
+const TTS_ENDPOINT = "http://localhost:8000/api/tts";
 
-// Helper: Pauses execution to simulate taking a breath
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+let audioContext = null;
+let analyser = null;
+let source = null;
+let animationFrameId = null;
+let currentAudio = null;
+let currentObjectUrl = null;
+let isActive = false;
 
-// Helper: Generates slight random variations for pitch and rate
-const randomize = (base, variance) => base + (Math.random() * variance * 2 - variance);
-
-/**
- * 1. CLOUD AI VOICE (The only true human-sounding option)
- */
-async function elevenSpeak(text) {
-  if (!ELEVENLABS_KEY) throw new Error("Missing API Key");
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`;
-
-  const payload = {
-    text: text,
-    model_id: "eleven_turbo_v2_5", // Use turbo for best conversational pacing
-    voice_settings: { stability: 0.35, similarity_boost: 0.8 }
-  };
-
-  const resp = await axios.post(url, payload, {
-    headers: { "xi-api-key": ELEVENLABS_KEY, "Content-Type": "application/json" },
-    responseType: "arraybuffer",
-    timeout: 15000
-  });
-
-  const blob = new Blob([resp.data], { type: "audio/mpeg" });
-  const audio = new Audio(URL.createObjectURL(blob));
-  
-  return new Promise((resolve) => {
-    audio.onended = resolve;
-    audio.play();
-  });
+// Initialize the Web Audio API context
+function initAudioContext() {
+  if (!audioContext) {
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioContext.createAnalyser();
+    analyser.fftSize = 256; 
+    analyser.smoothingTimeConstant = 0.5; // Smooths out the mouth jitter
+  }
 }
 
-/**
- * 2. ADVANCED BROWSER MODULATION ALGORITHM
- * Hunts for the best male voice, splits text into clauses, and manipulates 
- * the pitch/rate dynamically to fight the "flat" robotic sound.
- */
-function getBestMaleVoice() {
-  const voices = window.speechSynthesis.getVoices();
-  
-  // Strict priority for Neural/High-Quality OS voices
-  const premiumMaleVoices = [
-    "Microsoft Christopher Online (Natural) - English (United States)",
-    "Microsoft Guy Online (Natural) - English (United States)",
-    "Microsoft Eric Online (Natural) - English (United States)",
-    "Google UK English Male",
-    "Alex", 
-    "Daniel"
-  ];
-
-  for (const name of premiumMaleVoices) {
-    const found = voices.find(v => v.name.includes(name) || v.name === name);
-    if (found) return found;
+// Analyzes the actual sound waves to drive the mouth
+function tickAnimation() {
+  if (!isActive || !analyser) {
+    audioState.targetMouth = 0;
+    return;
   }
 
-  // Generic fallback
-  return voices.find(v => /en-?/.test(v.lang) && /male|boy|man/i.test(v.name)) || voices[0];
+  const dataArray = new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteFrequencyData(dataArray);
+
+  // Calculate average volume (0 to 255)
+  let sum = 0;
+  for (let i = 0; i < dataArray.length; i++) {
+    sum += dataArray[i];
+  }
+  let averageVolume = sum / dataArray.length;
+
+  // Map the volume to mouth openness (0.0 to 1.0)
+  // Tweak the 50.0 value to make the mouth open wider or less wide
+  let mouthOpenness = Math.min(averageVolume / 50.0, 1.0);
+  
+  // Set a small threshold so background noise doesn't twitch the lips
+  if (averageVolume < 2) {
+      mouthOpenness = 0;
+  }
+
+  audioState.targetMouth = mouthOpenness;
+
+  animationFrameId = requestAnimationFrame(tickAnimation);
 }
 
-async function advancedBrowserSpeak(text) {
+function stopEngine() {
+  isActive = false;
+  audioState.targetMouth = 0;
+  audioState.isWebSpeech = false;
+
+  if (animationFrameId) {
+    cancelAnimationFrame(animationFrameId);
+    animationFrameId = null;
+  }
+}
+
+function cleanupAudio() {
+  if (currentAudio) {
+    currentAudio.pause();
+    currentAudio.src = "";
+    currentAudio = null;
+  }
+  if (source) {
+    source.disconnect();
+    source = null;
+  }
+  if (currentObjectUrl) {
+    URL.revokeObjectURL(currentObjectUrl);
+    currentObjectUrl = null;
+  }
+}
+
+export function speak(text) {
   return new Promise(async (resolve) => {
-    if (!("speechSynthesis" in window)) return resolve();
-    window.speechSynthesis.cancel(); // Clear queue
+    if (!text || typeof window === "undefined") {
+      resolve();
+      return;
+    }
 
-    const voice = getBestMaleVoice();
+    stopSpeaking();
 
-    // CHUNKING: Split the text by natural sentence boundaries and pauses
-    // Matches sentences ending in . ! ? or pausing at , ; :
-    const phraseRegex = /([^.,!?:;]+[.,!?:;]*)/g;
-    const phrases = text.match(phraseRegex) || [text];
-
-    for (let i = 0; i < phrases.length; i++) {
-      const phrase = phrases[i].trim();
-      if (!phrase) continue;
-
-      await new Promise((phraseResolve) => {
-        const u = new SpeechSynthesisUtterance(phrase);
-        if (voice) u.voice = voice;
-
-        // MODULATION: Base calm male settings
-        let targetPitch = 0.90;
-        let targetRate = 0.90;
-
-        // Apply slight randomization so it doesn't sound completely static
-        u.rate = randomize(targetRate, 0.02);
-
-        // Prosody adjustments based on punctuation
-        if (phrase.endsWith("?")) {
-          // Questions usually end with an upward inflection
-          u.pitch = randomize(1.05, 0.03); 
-        } else if (phrase.endsWith(".") || phrase.endsWith("!")) {
-          // Statements often drop in pitch at the end
-          u.pitch = randomize(0.85, 0.02);
-        } else {
-          // Mid-sentence clauses remain steady
-          u.pitch = randomize(targetPitch, 0.02);
-        }
-
-        u.volume = 1.0;
-        u.onend = () => phraseResolve();
-        u.onerror = () => phraseResolve(); // Prevent hanging on error
-
-        window.speechSynthesis.speak(u);
+    try {
+      const response = await fetch(TTS_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text,
+          voice: "en-IN-PrabhatNeural",
+          rate: "+0%",
+          volume: "+0%",
+        }),
       });
 
-      // SIMULATED BREATHING: Inject physical time delays between phrases
-      if (phrase.endsWith(".") || phrase.endsWith("!") || phrase.endsWith("?")) {
-        await sleep(500); // Deep breath between full sentences
-      } else if (phrase.endsWith(",") || phrase.endsWith(";") || phrase.endsWith(":")) {
-        await sleep(200); // Quick breath for commas
-      }
-    }
+      if (!response.ok) throw new Error("TTS request failed");
 
-    resolve();
+      const blob = await response.blob();
+      currentObjectUrl = URL.createObjectURL(blob);
+      currentAudio = new Audio(currentObjectUrl);
+      currentAudio.crossOrigin = "anonymous";
+
+      // Hook the audio up to the Analyzer
+      initAudioContext();
+      if (audioContext.state === 'suspended') {
+          await audioContext.resume();
+      }
+
+      source = audioContext.createMediaElementSource(currentAudio);
+      source.connect(analyser);
+      analyser.connect(audioContext.destination);
+
+      currentAudio.onplay = () => {
+        isActive = true;
+        audioState.isWebSpeech = true;
+        tickAnimation(); // Start real-time analysis
+      };
+
+      currentAudio.onended = () => {
+        stopEngine();
+        cleanupAudio();
+        resolve();
+      };
+
+      currentAudio.onerror = () => {
+        stopEngine();
+        cleanupAudio();
+        resolve();
+      };
+
+      await currentAudio.play();
+    } catch (error) {
+      console.error("TTS failed:", error);
+      stopEngine();
+      cleanupAudio();
+      resolve();
+    }
   });
 }
 
-/**
- * 3. PUBLIC EXPORT
- */
-export async function speak(text) {
-  if (!text) return;
-  
-  try {
-    console.log("Attempting ElevenLabs Cloud Voice...");
-    await elevenSpeak(text);
-  } catch (error) {
-    console.error("🔴 ElevenLabs Failed (Check API Key). Triggering local modulation engine.");
-    
-    // Wait for voices to load if it's the first time
-    if (window.speechSynthesis.getVoices().length > 0) {
-      await advancedBrowserSpeak(text);
-    } else {
-      window.speechSynthesis.onvoiceschanged = async () => {
-        window.speechSynthesis.onvoiceschanged = null;
-        await advancedBrowserSpeak(text);
-      };
-    }
-  }
+export function stopSpeaking() {
+  stopEngine();
+  cleanupAudio();
+}
+
+export function isCurrentlySpeaking() {
+  return isActive;
 }
